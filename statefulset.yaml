@@ -1,16 +1,15 @@
-{{- if .Values.database.enabled }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: mysql
-  namespace: {{ .Values.global.namespaces.db }}
+  namespace: zoochacha-db
 spec:
   selector:
     matchLabels:
       app: mysql
       app.kubernetes.io/name: mysql
   serviceName: mysql
-  replicas: {{ .Values.database.replicas }}
+  replicas: 3
   volumeClaimTemplates:
   - metadata:
       name: data
@@ -18,8 +17,8 @@ spec:
       accessModes: ["ReadWriteOnce"]
       resources:
         requests:
-          storage: {{ .Values.database.storage.size }}
-      storageClassName: {{ .Values.database.storageClass.name }}
+          storage: 20Gi
+      storageClassName: mysql-storage
   template:
     metadata:
       labels:
@@ -28,7 +27,7 @@ spec:
     spec:
       initContainers:
       - name: init-mysql
-        image: {{ .Values.database.image.repository }}:{{ .Values.database.image.tag }}
+        image: mysql:8.0.35
         command:
         - bash
         - "-c"
@@ -52,7 +51,7 @@ spec:
         - name: config-map
           mountPath: /mnt/config-map
       - name: clone-mysql
-        image: {{ .Values.database.xtrabackup.repository }}:{{ .Values.database.xtrabackup.tag }}
+        image: percona/percona-xtrabackup:8.0.35
         command:
         - bash
         - "-c"
@@ -76,21 +75,16 @@ spec:
           mountPath: /etc/mysql/conf.d
       containers:
       - name: mysql
-        image: {{ .Values.database.image.repository }}:{{ .Values.database.image.tag }}
+        image: mysql:8.0.35
         env:
-        {{- if .Values.database.rootPassword }}
         - name: MYSQL_ROOT_PASSWORD
           valueFrom:
             secretKeyRef:
-              name: db-credentials
-              key: rootPassword
-        {{- else }}
-        - name: MYSQL_ALLOW_EMPTY_PASSWORD
-          value: "1"
-        {{- end }}
+              name: mysql-credentials
+              key: root-password
         ports:
         - name: mysql
-          containerPort: {{ .Values.database.service.port }}
+          containerPort: 3306
         volumeMounts:
         - name: data
           mountPath: /var/lib/mysql
@@ -98,7 +92,12 @@ spec:
         - name: conf
           mountPath: /etc/mysql/conf.d
         resources:
-          {{- toYaml .Values.database.resources | nindent 10 }}
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 2000m
+            memory: 4Gi
         livenessProbe:
           exec:
             command: ["mysqladmin", "ping"]
@@ -107,13 +106,12 @@ spec:
           timeoutSeconds: 5
         readinessProbe:
           exec:
-            # Check we can execute queries over TCP (skip-networking is off).
             command: ["mysql", "-h", "127.0.0.1", "-e", "SELECT 1"]
           initialDelaySeconds: 5
           periodSeconds: 2
           timeoutSeconds: 1
       - name: xtrabackup
-        image: {{ .Values.database.xtrabackup.repository }}:{{ .Values.database.xtrabackup.tag }}
+        image: percona/percona-xtrabackup:8.0.35
         ports:
         - name: xtrabackup
           containerPort: 3307
@@ -126,47 +124,32 @@ spec:
 
           # Determine binlog position of cloned data, if any.
           if [[ -f xtrabackup_slave_info && "x$(<xtrabackup_slave_info)" != "x" ]]; then
-            # XtraBackup already generated a partial "CHANGE MASTER TO" query
-            # because we're cloning from an existing replica. (Need to remove the tailing semicolon!)
             cat xtrabackup_slave_info | sed -E 's/;$//g' > change_master_to.sql.in
-            # Ignore xtrabackup_binlog_info in this case (it's useless).
             rm -f xtrabackup_slave_info xtrabackup_binlog_info
           elif [[ -f xtrabackup_binlog_info ]]; then
-            # We're cloning directly from primary. Parse binlog position.
             [[ `cat xtrabackup_binlog_info` =~ ^(.*?)[[:space:]]+(.*?)$ ]] || exit 1
             rm -f xtrabackup_binlog_info xtrabackup_slave_info
             echo "CHANGE MASTER TO MASTER_LOG_FILE='${BASH_REMATCH[1]}',\
                   MASTER_LOG_POS=${BASH_REMATCH[2]}" > change_master_to.sql.in
           fi
 
-          # Check if we need to complete a clone by starting replication.
           if [[ -f change_master_to.sql.in ]]; then
             echo "Waiting for mysqld to be ready (accepting connections)"
             until mysql -h 127.0.0.1 -e "SELECT 1"; do sleep 1; done
 
             echo "Initializing replication from clone position"
-            {{- if .Values.database.rootPassword }}
             mysql -h 127.0.0.1 -p$MYSQL_ROOT_PASSWORD \
-            {{- else }}
-            mysql -h 127.0.0.1 \
-            {{- end }}
                   -e "$(<change_master_to.sql.in), \
                           MASTER_HOST='mysql-0.mysql', \
                           MASTER_USER='root', \
-                          {{- if .Values.database.rootPassword }}
                           MASTER_PASSWORD='$MYSQL_ROOT_PASSWORD', \
-                          {{- else }}
-                          MASTER_PASSWORD='', \
-                          {{- end }}
                           MASTER_CONNECT_RETRY=10; \
                         START SLAVE;" || exit 1
-            # In case of container restart, attempt this at-most-once.
             mv change_master_to.sql.in change_master_to.sql.orig
           fi
 
-          # Start a server to send backups when requested by peers.
           exec ncat --listen --keep-open --send-only --max-conns=1 3307 -c \
-            "xtrabackup --backup --slave-info --stream=xbstream --host=127.0.0.1 --user=root {{- if .Values.database.rootPassword }} --password=$MYSQL_ROOT_PASSWORD{{- end }}"          
+            "xtrabackup --backup --slave-info --stream=xbstream --host=127.0.0.1 --user=root --password=$MYSQL_ROOT_PASSWORD"          
         volumeMounts:
         - name: data
           mountPath: /var/lib/mysql
@@ -177,18 +160,18 @@ spec:
           requests:
             cpu: 100m
             memory: 100Mi
-        {{- if .Values.database.rootPassword }}
+          limits:
+            cpu: 300m
+            memory: 300Mi
         env:
         - name: MYSQL_ROOT_PASSWORD
           valueFrom:
             secretKeyRef:
-              name: db-credentials
-              key: rootPassword
-        {{- end }}
+              name: mysql-credentials
+              key: root-password
       volumes:
       - name: conf
         emptyDir: {}
       - name: config-map
         configMap:
-          name: mysql
-{{- end }} 
+          name: mysql 
