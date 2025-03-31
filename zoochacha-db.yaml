@@ -6,9 +6,10 @@ metadata:
 provisioner: ebs.csi.aws.com
 parameters:
   type: gp3
+  fsType: ext4
 reclaimPolicy: Retain
 allowVolumeExpansion: true
-volumeBindingMode: Immediate
+volumeBindingMode: WaitForFirstConsumer
 ---
 # ConfigMap
 apiVersion: v1
