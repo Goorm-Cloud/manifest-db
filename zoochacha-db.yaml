@@ -1,0 +1,270 @@
+# StorageClass
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: mysql-storage
+provisioner: kubernetes.io/aws-ebs
+parameters:
+  type: gp3
+reclaimPolicy: Retain
+allowVolumeExpansion: true
+---
+# ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql
+  namespace: zoochacha-db
+  labels:
+    app: mysql
+    app.kubernetes.io/name: mysql
+    app.kubernetes.io/part-of: zoochacha
+    app.kubernetes.io/managed-by: argocd
+    security-level: medium
+data:
+  primary.cnf: |
+    [mysqld]
+    log-bin
+    max_connections = 500
+    max_allowed_packet = 32M
+    innodb_buffer_pool_size = 512M
+    innodb_log_file_size = 128M
+    innodb_flush_log_at_trx_commit = 2
+    innodb_flush_method = O_DIRECT
+    skip-name-resolve
+    character-set-server = utf8mb4
+    collation-server = utf8mb4_unicode_ci
+    default-time-zone = '+09:00'
+    secure-file-priv = /var/lib/mysql-files
+    ssl = ON
+    ssl-cipher = TLSv1.2
+    require_secure_transport = ON
+  replica.cnf: |
+    [mysqld]
+    super-read-only
+    max_connections = 500
+    max_allowed_packet = 32M
+    innodb_buffer_pool_size = 512M
+    innodb_log_file_size = 128M
+    innodb_flush_log_at_trx_commit = 2
+    innodb_flush_method = O_DIRECT
+    skip-name-resolve
+    character-set-server = utf8mb4
+    collation-server = utf8mb4_unicode_ci
+    default-time-zone = '+09:00'
+    secure-file-priv = /var/lib/mysql-files
+    ssl = ON
+    ssl-cipher = TLSv1.2
+    require_secure_transport = ON
+---
+# Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: zoochacha-db
+  labels:
+    app: mysql
+    app.kubernetes.io/name: mysql
+spec:
+  ports:
+  - name: mysql
+    port: 3306
+  clusterIP: None
+  selector:
+    app: mysql
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-read
+  namespace: zoochacha-db
+  labels:
+    app: mysql
+    app.kubernetes.io/name: mysql
+    readonly: "true"
+spec:
+  ports:
+  - name: mysql
+    port: 3306
+  selector:
+    app: mysql
+---
+# StatefulSet
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: zoochacha-db
+spec:
+  selector:
+    matchLabels:
+      app: mysql
+      app.kubernetes.io/name: mysql
+  serviceName: mysql
+  replicas: 3
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 20Gi
+      storageClassName: mysql-storage
+  template:
+    metadata:
+      labels:
+        app: mysql
+        app.kubernetes.io/name: mysql
+    spec:
+      initContainers:
+      - name: init-mysql
+        image: mysql:8.0.35
+        command:
+        - bash
+        - "-c"
+        - |
+          set -ex
+          # Generate mysql server-id from pod ordinal index.
+          [[ $HOSTNAME =~ -([0-9]+)$ ]] || exit 1
+          ordinal=${BASH_REMATCH[1]}
+          echo [mysqld] > /mnt/conf.d/server-id.cnf
+          # Add an offset to avoid reserved server-id=0 value.
+          echo server-id=$((100 + $ordinal)) >> /mnt/conf.d/server-id.cnf
+          # Copy appropriate conf.d files from config-map to emptyDir.
+          if [[ $ordinal -eq 0 ]]; then
+            cp /mnt/config-map/primary.cnf /mnt/conf.d/
+          else
+            cp /mnt/config-map/replica.cnf /mnt/conf.d/
+          fi          
+        volumeMounts:
+        - name: conf
+          mountPath: /mnt/conf.d
+        - name: config-map
+          mountPath: /mnt/config-map
+      - name: clone-mysql
+        image: percona/percona-xtrabackup:8.0.35
+        command:
+        - bash
+        - "-c"
+        - |
+          set -ex
+          # Skip the clone if data already exists.
+          [[ -d /var/lib/mysql/mysql ]] && exit 0
+          # Skip the clone on primary (ordinal index 0).
+          [[ `hostname` =~ -([0-9]+)$ ]] || exit 1
+          ordinal=${BASH_REMATCH[1]}
+          [[ $ordinal -eq 0 ]] && exit 0
+          # Clone data from previous peer.
+          ncat --recv-only mysql-$(($ordinal-1)).mysql 3307 | xbstream -x -C /var/lib/mysql
+          # Prepare the backup.
+          xtrabackup --prepare --target-dir=/var/lib/mysql          
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/mysql
+          subPath: mysql
+        - name: conf
+          mountPath: /etc/mysql/conf.d
+      containers:
+      - name: mysql
+        image: mysql:8.0.35
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-credentials
+              key: root-password
+        ports:
+        - name: mysql
+          containerPort: 3306
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/mysql
+          subPath: mysql
+        - name: conf
+          mountPath: /etc/mysql/conf.d
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+        livenessProbe:
+          exec:
+            command: ["mysqladmin", "ping"]
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+        readinessProbe:
+          exec:
+            command: ["mysql", "-h", "127.0.0.1", "-e", "SELECT 1"]
+          initialDelaySeconds: 5
+          periodSeconds: 2
+          timeoutSeconds: 1
+      - name: xtrabackup
+        image: percona/percona-xtrabackup:8.0.35
+        ports:
+        - name: xtrabackup
+          containerPort: 3307
+        command:
+        - bash
+        - "-c"
+        - |
+          set -ex
+          cd /var/lib/mysql
+
+          # Determine binlog position of cloned data, if any.
+          if [[ -f xtrabackup_slave_info && "x$(<xtrabackup_slave_info)" != "x" ]]; then
+            cat xtrabackup_slave_info | sed -E 's/;$//g' > change_master_to.sql.in
+            rm -f xtrabackup_slave_info xtrabackup_binlog_info
+          elif [[ -f xtrabackup_binlog_info ]]; then
+            [[ `cat xtrabackup_binlog_info` =~ ^(.*?)[[:space:]]+(.*?)$ ]] || exit 1
+            rm -f xtrabackup_binlog_info xtrabackup_slave_info
+            echo "CHANGE MASTER TO MASTER_LOG_FILE='${BASH_REMATCH[1]}',\
+                  MASTER_LOG_POS=${BASH_REMATCH[2]}" > change_master_to.sql.in
+          fi
+
+          if [[ -f change_master_to.sql.in ]]; then
+            echo "Waiting for mysqld to be ready (accepting connections)"
+            until mysql -h 127.0.0.1 -e "SELECT 1"; do sleep 1; done
+
+            echo "Initializing replication from clone position"
+            mysql -h 127.0.0.1 -p$MYSQL_ROOT_PASSWORD \
+                  -e "$(<change_master_to.sql.in), \
+                          MASTER_HOST='mysql-0.mysql', \
+                          MASTER_USER='root', \
+                          MASTER_PASSWORD='$MYSQL_ROOT_PASSWORD', \
+                          MASTER_CONNECT_RETRY=10; \
+                        START SLAVE;" || exit 1
+            mv change_master_to.sql.in change_master_to.sql.orig
+          fi
+
+          exec ncat --listen --keep-open --send-only --max-conns=1 3307 -c \
+            "xtrabackup --backup --slave-info --stream=xbstream --host=127.0.0.1 --user=root --password=$MYSQL_ROOT_PASSWORD"          
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/mysql
+          subPath: mysql
+        - name: conf
+          mountPath: /etc/mysql/conf.d
+        resources:
+          requests:
+            cpu: 100m
+            memory: 100Mi
+          limits:
+            cpu: 300m
+            memory: 300Mi
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-credentials
+              key: root-password
+      volumes:
+      - name: conf
+        emptyDir: {}
+      - name: config-map
+        configMap:
+          name: mysql 
