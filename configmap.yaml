@@ -1,19 +1,48 @@
-{{- if .Values.database.enabled }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: mysql
-  namespace: {{ .Values.global.namespaces.db }}
+  namespace: zoochacha-db
   labels:
     app: mysql
     app.kubernetes.io/name: mysql
+    app.kubernetes.io/part-of: zoochacha
+    app.kubernetes.io/managed-by: argocd
+    security-level: medium
 data:
   primary.cnf: |
     # Apply this config only on the primary.
     [mysqld]
-    log-bin    
+    log-bin
+    max_connections = 500
+    max_allowed_packet = 32M
+    innodb_buffer_pool_size = 512M
+    innodb_log_file_size = 128M
+    innodb_flush_log_at_trx_commit = 2
+    innodb_flush_method = O_DIRECT
+    skip-name-resolve
+    character-set-server = utf8mb4
+    collation-server = utf8mb4_unicode_ci
+    default-time-zone = '+09:00'
+    secure-file-priv = /var/lib/mysql-files
+    ssl = ON
+    ssl-cipher = TLSv1.2
+    require_secure_transport = ON
   replica.cnf: |
     # Apply this config only on replicas.
     [mysqld]
-    super-read-only    
-{{- end }} 
+    super-read-only
+    max_connections = 500
+    max_allowed_packet = 32M
+    innodb_buffer_pool_size = 512M
+    innodb_log_file_size = 128M
+    innodb_flush_log_at_trx_commit = 2
+    innodb_flush_method = O_DIRECT
+    skip-name-resolve
+    character-set-server = utf8mb4
+    collation-server = utf8mb4_unicode_ci
+    default-time-zone = '+09:00'
+    secure-file-priv = /var/lib/mysql-files
+    ssl = ON
+    ssl-cipher = TLSv1.2
+    require_secure_transport = ON 
