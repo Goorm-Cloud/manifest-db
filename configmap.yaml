@@ -11,7 +11,6 @@ metadata:
     security-level: medium
 data:
   primary.cnf: |
-    # Apply this config only on the primary.
     [mysqld]
     log-bin
     max_connections = 500
@@ -29,7 +28,6 @@ data:
     ssl-cipher = TLSv1.2
     require_secure_transport = ON
   replica.cnf: |
-    # Apply this config only on replicas.
     [mysqld]
     super-read-only
     max_connections = 500
