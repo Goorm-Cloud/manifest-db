@@ -3,12 +3,12 @@ apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: mysql-storage
-provisioner: ebs.csi.aws.com
+provisioner: kubernetes.io/aws-ebs
 parameters:
   type: gp3
 reclaimPolicy: Retain
 allowVolumeExpansion: true
-volumeBindingMode: WaitForFirstConsumer
+volumeBindingMode: Immediate
 ---
 # ConfigMap
 apiVersion: v1
